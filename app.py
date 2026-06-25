@@ -11,7 +11,8 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
 import audit
-from signals import llm_signal
+import scoring
+from signals import llm_signal, stylometry_signal
 
 load_dotenv()  # load GROQ_API_KEY from .env
 
@@ -37,26 +38,32 @@ def submit():
 
     content_id = str(uuid.uuid4())
 
-    # --- Signal 1: LLM classifier ---
-    sig1 = llm_signal(text)
+    # --- Detection pipeline: two independent signals ---
+    sig1 = llm_signal(text)               # Signal 1: semantic (Groq)
+    sig2 = stylometry_signal(text)        # Signal 2: structural (pure Python)
     llm_score = sig1["ai_score"]
+    stylo_score = sig2["ai_score"]
 
-    # --- Placeholders until Milestone 4 wires in the second signal + real scoring ---
-    confidence = round(abs(llm_score - 0.5) * 2, 3)  # placeholder: certainty from one signal
-    attribution = "pending"
+    # --- Confidence scoring: combine both signals (planning.md §3) ---
+    result = scoring.score(llm_score, stylo_score, stylo_reliable=sig2["reliable"])
+    attribution = result["attribution"]
+    confidence = result["confidence"]
+    ai_probability = result["ai_probability"]
+
+    # --- Placeholder until Milestone 5 wires in the transparency label ---
     label = {
-        "headline": "Analysis in progress",
-        "body": "Confidence scoring and transparency label are added in Milestone 4–5.",
+        "headline": "Analysis complete",
+        "body": "Transparency label is added in Milestone 5.",
     }
 
-    signals = {"llm_score": llm_score}
+    signals = {"llm_score": llm_score, "stylo_score": stylo_score}
 
     audit.log_classification(
         content_id=content_id,
         creator_id=creator_id,
         attribution=attribution,
         confidence=confidence,
-        ai_probability=llm_score,  # placeholder: single-signal estimate
+        ai_probability=ai_probability,
         signals=signals,
         status="classified",
     )
@@ -65,8 +72,13 @@ def submit():
         "content_id": content_id,
         "attribution": attribution,
         "confidence": confidence,
-        "ai_probability": llm_score,
-        "signals": {**signals, "llm_rationale": sig1["rationale"]},
+        "ai_probability": ai_probability,
+        "signals": {
+            "llm_score": llm_score,
+            "llm_rationale": sig1["rationale"],
+            "stylo_score": stylo_score,
+            "stylo_metrics": sig2["metrics"],
+        },
         "label": label,
     })
 

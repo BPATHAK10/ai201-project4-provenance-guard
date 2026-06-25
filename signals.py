@@ -9,6 +9,8 @@ Each signal returns a dict with at least an `ai_score` in [0, 1] = estimated P(A
 
 import json
 import os
+import re
+import statistics
 
 from groq import Groq
 
@@ -77,3 +79,86 @@ def llm_signal(text):
             "rationale": f"LLM signal unavailable ({type(exc).__name__}); defaulting to uncertain.",
             "ok": False,
         }
+
+
+# --------------------------------------------------------------------------- #
+# Signal 2 — Stylometric heuristics (structural)
+# --------------------------------------------------------------------------- #
+# Three measurable metrics (planning.md §2), each mapped to a 0-1 "AI-likeness"
+# contribution, then averaged. AI prose is statistically MORE uniform and tidy;
+# human writing is burstier, messier, and more lexically irregular.
+
+MIN_RELIABLE_WORDS = 40  # below this, structural stats are noise (planning.md §6)
+
+_WORD_RE = re.compile(r"[A-Za-z']+")
+_SENT_SPLIT_RE = re.compile(r"[.!?]+(?:\s+|$)")
+
+
+def _clamp01(x):
+    return max(0.0, min(1.0, x))
+
+
+def _split_sentences(text):
+    parts = [s.strip() for s in _SENT_SPLIT_RE.split(text) if s.strip()]
+    return parts or [text.strip()]
+
+
+def stylometry_signal(text):
+    """Signal 2: structural statistics -> P(AI).
+
+    Returns {"ai_score": float in [0,1], "metrics": {...}, "reliable": bool}.
+    `reliable` is False for very short texts, so the scorer can lower confidence.
+    """
+    words = _WORD_RE.findall(text)
+    word_count = len(words)
+    sentences = _split_sentences(text)
+    reliable = word_count >= MIN_RELIABLE_WORDS
+
+    # --- Metric 1: sentence-length burstiness (variance) ---
+    # Humans vary sentence length a lot; AI is uniform. LOW variation -> AI-like.
+    sent_word_counts = [len(_WORD_RE.findall(s)) for s in sentences]
+    if len(sent_word_counts) >= 2:
+        stdev = statistics.pstdev(sent_word_counts)
+    else:
+        stdev = 0.0
+    # stdev ~0 (uniform) -> 1.0 AI-like; stdev >= 9 words (bursty) -> 0.0.
+    burstiness_ai = _clamp01(1.0 - (stdev / 9.0))
+
+    # --- Metric 2: type-token ratio (vocabulary diversity) ---
+    # Lower diversity (lots of repeated/connective vocab) -> more AI-like.
+    lowered = [w.lower() for w in words]
+    ttr = len(set(lowered)) / word_count if word_count else 0.0
+    # TTR is length-sensitive: typical prose (AI or human) sits ~0.80-0.90, so we treat
+    # that as NEUTRAL (~0.5) and only flag genuinely repetitive text. ttr 0.45 (refrains)
+    # -> 1.0 AI; ttr 0.85 -> ~0.5; ttr 0.95+ -> ~0.4 (diverse).
+    ttr_ai = _clamp01(1.0 - (ttr - 0.45) / 0.8)
+
+    # --- Metric 3: punctuation & casing tidiness ---
+    # Humans are irregular (lowercase starts, ellipses, ?!, em-dashes, ALL CAPS,
+    # contractions). AI is tidy. HIGH tidiness -> AI-like.
+    irregular = 0
+    irregular += len(re.findall(r"\.{2,}|\?!|!\?|—|--", text))      # ellipses / interrobang / dashes
+    irregular += len(re.findall(r"\b[A-Z]{3,}\b", text))            # ALL-CAPS emphasis (3+; skips 'AI','US')
+    irregular += len(re.findall(r"\b\w+'\w+\b", text))              # contractions (don't, i'm)
+    # lowercase sentence starts
+    irregular += sum(1 for s in sentences if s[:1].islower())
+    irregularity_rate = irregular / max(1, len(sentences))
+    # rate >= 1.5 markers/sentence (messy/human) -> 0.0 AI; rate 0 (tidy) -> 1.0 AI.
+    tidiness_ai = _clamp01(1.0 - (irregularity_rate / 1.5))
+
+    ai_score = (burstiness_ai + ttr_ai + tidiness_ai) / 3.0
+
+    return {
+        "ai_score": round(ai_score, 4),
+        "reliable": reliable,
+        "metrics": {
+            "word_count": word_count,
+            "sentence_count": len(sentences),
+            "sentence_len_stdev": round(stdev, 3),
+            "type_token_ratio": round(ttr, 4),
+            "irregularity_rate": round(irregularity_rate, 3),
+            "burstiness_ai": round(burstiness_ai, 4),
+            "ttr_ai": round(ttr_ai, 4),
+            "tidiness_ai": round(tidiness_ai, 4),
+        },
+    }
